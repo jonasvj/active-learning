@@ -1,0 +1,17 @@
+active_learning_seed: 0
+
+defaults:
+  - model: dropout_cnn
+  - data: mnist
+  - inference: dropout
+  - _self_
+
+active_learning:
+  n_acquisitions: 100
+  acquisition_size: 10
+  acquisition_function: random_acquisition
+  balanced_initial_set: True
+  init_acquisition_size: 20
+  active_only: True
+  batch_size: 128
+

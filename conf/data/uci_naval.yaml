@@ -1,0 +1,7 @@
+data_class: ActiveLearningUCINaval
+
+data_hparams:
+  seed: 0
+  train_prop: 0.7
+  val_prop: 0.15
+  target: 16

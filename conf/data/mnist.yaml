@@ -1,0 +1,5 @@
+data_class: ActiveLearningMNIST
+
+data_hparams:
+  seed: 0
+  n_val: 100
