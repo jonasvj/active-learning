@@ -1,7 +1,0 @@
-
-inference_hparams:
-  n_epochs: 50
-  lr: 1e-3
-  weight_decay: 2.5
-  dynamic_weight_decay: True
-  optim_class: Adam

@@ -1,0 +1,29 @@
+inference_class: SWAG
+
+init_hparams:
+  K: 50
+  n_posterior_samples: 100
+  with_gamma: False
+  sequential_samples: False
+
+fit_hparams:
+  optimize_covar: False
+  fit_model_hparams:
+    n_epochs: 50
+    lr: 1e-3
+    weight_decay: 2.5
+    dynamic_weight_decay: True
+  fit_swag_hparams:
+    swag_batch_size: null
+    swag_steps: 1000
+    swag_lr: 1e-3
+    update_freq: 10
+    clip_value: null
+    save_iterates: False
+    val_criterion: accuracy
+  fit_covar_hparams:
+    svi_lr: 1e-2
+    svi_steps: 1000
+    mini_batch: False
+    n_variational_samples: 100
+    sequential_samples: False

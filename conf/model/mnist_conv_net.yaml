@@ -1,0 +1,8 @@
+model_class: MNISTConvNet
+
+model_hparams:
+  drop_probs: [0.25, 0.5]
+  prior: False
+  prior_var: 1
+  hyperprior: False
+  device: cuda

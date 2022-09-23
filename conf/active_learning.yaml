@@ -1,17 +1,18 @@
-active_learning_seed: 0
+al_seed: 0
 
 defaults:
-  - model: dropout_cnn
+  - model: mnist_conv_net
   - data: mnist
-  - inference: dropout
+  - inference: monte_carlo_dropout
   - _self_
 
-active_learning:
+al:
   n_acquisitions: 100
   acquisition_size: 10
-  acquisition_function: random_acquisition
+  acquisition_function: bald
   balanced_initial_set: True
   init_acquisition_size: 20
-  active_only: True
-  batch_size: 128
+  pool_subsample: null
 
+misc:
+  result_path: results/test_results.dill

@@ -1,6 +1,7 @@
-data_class: ActiveLearningUCINaval
+data_class: UCINavalDataset
 
 data_hparams:
+  batch_size: 64
   seed: 0
   train_prop: 0.7
   val_prop: 0.15

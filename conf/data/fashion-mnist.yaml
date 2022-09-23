@@ -1,0 +1,6 @@
+data_class: FashionMNISTDataset
+
+data_hparams:
+  batch_size: 128
+  seed: 0
+  n_val: 100

@@ -1,0 +1,10 @@
+inference_class: MonteCarloDropout
+
+init_hparams:
+  n_posterior_samples: 100
+
+fit_hparams:
+  n_epochs: 50
+  lr: 1e-3
+  weight_decay: 2.5
+  dynamic_weight_decay: True

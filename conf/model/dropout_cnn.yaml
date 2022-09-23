@@ -1,4 +1,0 @@
-model_class: DropoutCNN
-
-model_hparams:
-  device: null
