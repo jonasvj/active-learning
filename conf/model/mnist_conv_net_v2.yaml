@@ -1,0 +1,4 @@
+model_class: MNISTConvNetV2
+
+model_hparams:
+  device: cuda

@@ -1,7 +1,6 @@
-inference_class: MonteCarloDropout
+inference_class: Deterministic
 
-init_hparams:
-  n_posterior_samples: 100
+init_hparams: {}
 
 fit_hparams:
   fit_model_hparams:

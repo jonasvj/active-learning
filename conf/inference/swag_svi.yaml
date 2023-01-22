@@ -1,4 +1,4 @@
-inference_class: SWAG
+inference_class: SWAGSVI
 
 init_hparams:
   K: 50
@@ -20,3 +20,9 @@ fit_hparams:
     clip_value: null
     save_iterates: False,
     val_criterion: accuracy
+  fit_covar_hparams:
+    svi_lr: 1e-2
+    svi_epochs: 100
+    mini_batch: false
+    n_variational_samples: 100
+    sequential_samples: False

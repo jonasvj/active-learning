@@ -1,0 +1,4 @@
+data_class: OriginDataset
+
+data_hparams:
+  batch_size: 100

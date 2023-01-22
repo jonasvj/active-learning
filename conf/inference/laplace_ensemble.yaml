@@ -1,7 +1,9 @@
-inference_class: MonteCarloDropout
+inference_class: LaplaceEnsemble
 
 init_hparams:
   n_posterior_samples: 100
+  subset_of_weights: last_layer
+  n_components: 10
 
 fit_hparams:
   fit_model_hparams:
@@ -11,3 +13,6 @@ fit_hparams:
     dynamic_weight_decay: false
     early_stopping_patience: null
     min_epochs: null
+  fit_laplace_hparams:
+    hessian_structure: full
+    optimize_precision: true

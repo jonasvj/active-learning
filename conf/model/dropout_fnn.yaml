@@ -1,9 +1,0 @@
-model_class: DropoutFNN
-
-model_hparams:
-  n_in: null
-  n_out: 1
-  n_layers: 1
-  drop_probs: [0.5]
-  n_hidden: 50
-  device: null

@@ -1,7 +1,7 @@
-inference_class: MonteCarloDropout
+inference_class: Ensemble
 
 init_hparams:
-  n_posterior_samples: 100
+  n_components: 10
 
 fit_hparams:
   fit_model_hparams:

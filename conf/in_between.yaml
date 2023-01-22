@@ -1,0 +1,25 @@
+seed: 0
+
+defaults:
+  - inference: monte_carlo_dropout
+  - _self_
+
+data:
+  data_class: OriginDataset
+  data_hparams:
+    batch_size: 100
+
+model:
+  model_class: RegressionFNN
+  model_hparams:
+    n_in: 2
+    n_out: 1
+    hidden_sizes: [50]
+    drop_probs: [0.05]
+    noise_scale: 0.1
+    prior_scale_bias: 1.0
+    prior_scale_weight: 4.0
+    scale_weight_prior_by_dim: True
+    device: cuda
+
+data_path: experiments/in_between/data

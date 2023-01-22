@@ -1,0 +1,4 @@
+model_class: MNISTLogisticRegression
+
+model_hparams:
+  device: cuda

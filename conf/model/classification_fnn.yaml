@@ -1,0 +1,11 @@
+model_class: ClassificationFNN
+
+model_hparams:
+  n_in: 2
+  n_classes: 2
+  hidden_sizes: [50]
+  drop_probs: [0.05]
+  prior_scale_bias: 1
+  prior_scale_weight: 1
+  scale_weight_prior_by_dim: False
+  device: cuda

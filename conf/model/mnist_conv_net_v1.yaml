@@ -1,4 +1,4 @@
-model_class: MNISTConvNet
+model_class: MNISTConvNetV1
 
 model_hparams:
   drop_probs: [0.25, 0.5]
