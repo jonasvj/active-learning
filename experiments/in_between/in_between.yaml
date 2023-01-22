@@ -1,0 +1,179 @@
+seed: 0
+data_path: experiments/in_between/1HL_data/data.dill
+
+# Data hyperparameters
+data:
+  data_class: OriginDataset
+  data_hparams:
+    batch_size: 100
+
+# Model hyperparameters
+model:
+  model_class: RegressionFNN
+  model_hparams:
+    n_in: 2
+    n_out: 1
+    hidden_sizes: [50]
+    drop_probs: [0.05]
+    noise_scale: 0.1
+    prior_scale_bias: 1.0
+    prior_scale_weight: 4.0
+    scale_weight_prior_by_dim: True
+    device: cuda
+
+# MAP hyperparameters
+fit_model_hparams:
+    n_epochs: 100000
+    lr: 1e-3
+    cosine_annealing: false
+    weight_decay: 0
+    dynamic_weight_decay: false
+    early_stopping_patience: null
+    min_epochs: null
+
+# Key for selecting inference methods
+inference_key: deterministic
+
+# Number of monte carlo samples
+mc_samples: 500
+
+# Deterministic (just uses MAP estimate)
+deterministic:
+  inference_class: Deterministic
+  init_hparams: {}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Deep ensemble
+ensemble:
+  inference_class: Ensemble
+  init_hparams:
+    n_components: 10
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Monte carlo dropout
+mcdo:
+  inference_class: MonteCarloDropout
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Laplace approximation
+laplace:
+  inference_class: LaplaceApproximation
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: last_layer
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams:
+      hessian_structure: full
+      optimize_precision: true
+
+# Ensemble of Laplace approximations
+laplace_ensemble:
+  inference_class: LaplaceEnsemble
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: ${laplace.init_hparams.subset_of_weights}
+    n_components: 10
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams: ${laplace.fit_hparams.fit_laplace_hparams}
+
+# Laplace approximation refined by normalizing flow
+laplace_nf:
+  inference_class: NFRefinedLastLayerLaplace
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+  fit_hparams: 
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams: ${laplace.fit_hparams.fit_laplace_hparams}
+    fit_flow_hparams:
+      n_epochs: 100000
+      lr: 1e-3
+      cosine_annealing: false
+      transform: Radial
+      n_transforms: 10
+      num_particles: 32
+
+# SWAG
+swag:
+  inference_class: SWAG
+  init_hparams:
+    K: 1000
+    n_posterior_samples: ${mc_samples}
+    sequential_samples: False
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_swag_hparams:
+      swag_batch_size: 10
+      swag_epochs: 1000
+      swag_lr: 1e-3
+      clip_value: null
+      save_iterates: false
+      val_criterion: lpd
+
+# SWAG with scale of covariance matrix optimized by svi
+swag_svi:
+  inference_class: SWAGSVI
+  init_hparams: ${swag.init_hparams}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_swag_hparams: ${swag.fit_hparams.fit_swag_hparams}
+    fit_covar_hparams:
+      svi_lr: 1e-2
+      svi_epochs: 1000
+      mini_batch: false
+      n_variational_samples: 32
+      sequential_samples: false
+
+# Variational inference with full rank Gaussian
+vi_fr:
+  inference_class: VI
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: all
+  fit_hparams:
+    fit_vi_hparams:
+      n_epochs: 100000
+      lr: 1e-3
+      guide: multivariate
+      num_particles: 32
+      init_scale: 1e-4
+
+# Mean-field variational inference (diagonal Gaussian)
+vi_mf:
+  inference_class: VI
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: all
+  fit_hparams:
+    fit_vi_hparams:
+      n_epochs: ${vi_fr.fit_hparams.fit_vi_hparams.n_epochs}
+      lr: ${vi_fr.fit_hparams.fit_vi_hparams.lr}
+      guide: diagonal
+      num_particles: ${vi_fr.fit_hparams.fit_vi_hparams.num_particles}
+      init_scale: ${vi_fr.fit_hparams.fit_vi_hparams.init_scale}
+
+# Last layer variational inference with full rank Gaussian
+vi_ll_fr:
+  inference_class: VI
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: last_layer
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_vi_hparams: ${vi_fr.fit_hparams.fit_vi_hparams}
+
+# Last layer mean-field variational inference (diagonal Gaussian)
+vi_ll_mf:
+  inference_class: VI
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: last_layer
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_vi_hparams: ${vi_mf.fit_hparams.fit_vi_hparams}

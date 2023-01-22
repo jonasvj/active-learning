@@ -1,0 +1,153 @@
+seed: 0
+data_path: experiments/all_data/fmnist/experiment_data/data.dill
+
+# Data hyperparameters
+data:
+  data_class: FashionMNISTDataset
+  data_hparams:
+    batch_size: 128
+    test_batch_size: 2048
+    seed: ${seed}
+    n_val: 2000
+    standardize: false
+    reduced_test_set: false
+
+# Prior precision of parameters
+precision: 510. 
+sigma: 0.04428074427700476 # 1/sqrt(precision)
+
+# Model hyperparameters
+model:
+  model_class: LeNet
+  model_hparams:
+    dropout_rate: 0.
+    sigma_b: ${sigma}
+    sigma_w: ${sigma}
+    sigma_default: ${sigma}
+    scale_sigma_w_by_dim: false
+    use_prior: false 
+    device: cuda
+
+# MAP hyperparameters
+fit_model_hparams:
+    n_epochs: 100
+    lr: 1e-3
+    cosine_annealing: true
+    weight_decay: 5e-4
+    dynamic_weight_decay: false
+    early_stopping_patience: null
+    min_epochs: null
+    init_params: null
+
+# Key for selecting inference methods
+inference_key: deterministic
+
+# Number of monte carlo samples
+mc_samples: 20
+
+# Deterministic (just uses MAP estimate)
+deterministic:
+  inference_class: Deterministic
+  init_hparams: {}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Deep ensemble
+ensemble:
+  inference_class: Ensemble
+  init_hparams:
+    n_components: 5
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Monte carlo dropout
+mcdo:
+  inference_class: MonteCarloDropout
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+
+# Laplace approximation
+laplace:
+  inference_class: LaplaceApproximation
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: last_layer
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams:
+      hessian_structure: full
+      optimize_precision: true
+      prior_precision: ${precision}
+
+# Ensemble of Laplace approximations
+laplace_ensemble:
+  inference_class: LaplaceEnsemble
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+    subset_of_weights: ${laplace.init_hparams.subset_of_weights}
+    n_components: 5
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams: ${laplace.fit_hparams.fit_laplace_hparams}
+    covar_scale: 1.
+
+# Laplace approximation refined by normalizing flow
+laplace_nf:
+  inference_class: NFRefinedLastLayerLaplace
+  init_hparams:
+    n_posterior_samples: ${mc_samples}
+  fit_hparams: 
+    fit_model_hparams: ${fit_model_hparams}
+    fit_laplace_hparams: ${laplace.fit_hparams.fit_laplace_hparams}
+    fit_flow_hparams:
+      n_epochs: 20
+      lr: 1e-3
+      cosine_annealing: true
+      transform: Radial
+      n_transforms: 10
+      num_particles: 10
+
+# SWAG
+swag:
+  inference_class: SWAG
+  init_hparams:
+    K: 50
+    n_posterior_samples: ${mc_samples}
+    sequential_samples: False
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_swag_hparams:
+      swag_batch_size: 128
+      swag_epochs: 100
+      swag_lr: [1e-1,5e-2,1e-2,5e-3,4e-3,3e-3,2e-3,1e-3,5e-4,1e-4]
+      swag_weight_decay: ${fit_model_hparams.weight_decay}
+      swag_momentum: 0.9
+      clip_value: null
+      save_iterates: false
+      drop_out: false
+      val_criterion: lpd
+
+# SWAG with scale of covariance matrix optimized by svi
+swag_svi:
+  inference_class: SWAGSVI
+  init_hparams: ${swag.init_hparams}
+  fit_hparams:
+    fit_model_hparams: ${fit_model_hparams}
+    fit_swag_hparams:
+      swag_batch_size: ${swag.fit_hparams.fit_swag_hparams.swag_batch_size}
+      swag_epochs: ${swag.fit_hparams.fit_swag_hparams.swag_epochs}
+      swag_lr: 1e-3
+      swag_weight_decay: ${swag.fit_hparams.fit_swag_hparams.swag_weight_decay}
+      swag_momentum: ${swag.fit_hparams.fit_swag_hparams.swag_momentum}
+      clip_value: ${swag.fit_hparams.fit_swag_hparams.clip_value}
+      save_iterates: ${swag.fit_hparams.fit_swag_hparams.save_iterates}
+      drop_out: ${swag.fit_hparams.fit_swag_hparams.drop_out}
+      val_criterion: ${swag.fit_hparams.fit_swag_hparams.val_criterion}
+    fit_covar_hparams:
+      svi_lr: 1e-2
+      svi_epochs: 10
+      mini_batch: true
+      n_variational_samples: 10
+      sequential_samples: false
