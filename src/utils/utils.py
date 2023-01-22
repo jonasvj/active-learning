@@ -1,23 +1,27 @@
-import torch
 import os
 import dill
+import pyro
+import torch
 import random
 import numpy as np
+import torch.nn as nn
+import matplotlib.pyplot as plt
 
 
 def set_seed(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
+    #os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
 
     random.seed(seed)
     np.random.seed(seed)
+    pyro.set_rng_seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    #torch.backends.cudnn.benchmark = True
+    #torch.backends.cudnn.deterministic = False
+    #torch.use_deterministic_algorithms(False, warn_only=True)
 
 
 def set_device(device=None):
@@ -72,7 +76,37 @@ class ExperimentTracker:
 def label_entropy(labels):
     _, counts = np.unique(labels, return_counts=True)
     probs = counts / np.sum(counts)
-    return - np.sum(probs*np.log(probs))
+    return -np.sum(probs*np.log(probs))
+
+
+def savefig(filename, *args, **kwargs):
+    #plt.savefig(filename + '.pgf', *args, **kwargs)
+    plt.savefig(filename + '.pdf', *args, **kwargs)
+
+
+def set_dropout_on(model):
+    for module in model.modules():
+        if isinstance(module, nn.modules.dropout._DropoutNd):
+            module.train(mode=True)
+
+
+def set_dropout_off(model):
+    for module in model.modules():
+        if isinstance(module, nn.modules.dropout._DropoutNd):
+            module.train(mode=False)
+
+
+def minibatch_batchnorm(model):
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.train(mode=True)
+
+
+def population_batchnorm(model):
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.train(mode=False)
+
 
 
 if __name__ == '__main__':

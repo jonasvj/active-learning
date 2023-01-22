@@ -1,11 +1,12 @@
 import time
 import hydra
-from src.models import MNISTConvNet, DropoutFNN
-from src.utils import random_acquisition, max_entropy, bald, batch_bald, set_device
+
 from src.data import *
+from src.inference.deterministic import Deterministic
+from src.models import MNISTConvNet, MNISTConvNetAlt, DropoutFNN, MultinomialLogisticRegression
+from src.inference import MonteCarloDropout, SWAG, Deterministic, LaplaceApproximation
 from src.utils import ExperimentTracker, label_entropy, set_seed
-from torchmetrics import MetricCollection, Accuracy, CalibrationError
-from src.inference import MonteCarloDropout, SWAG
+from src.utils import random_acquisition, max_entropy, bald, batch_bald
 
 
 @hydra.main(
@@ -50,13 +51,6 @@ def main(cfg):
             acquisition_size=cfg.al.init_acquisition_size
         )
     
-    # Metrics
-    metric_collection = MetricCollection([
-        Accuracy(),
-        CalibrationError()
-    ])
-    metric_collection.to('cuda')
-
     val_dataloader = al_dataset.dataset.val_dataloader()
     test_dataloader = al_dataset.dataset.test_dataloader()
 
@@ -83,20 +77,11 @@ def main(cfg):
             **cfg.inference.fit_hparams
         )
 
-        # Compute metrics
+        # Evaluate model
         eval_start = time.time()
-        with torch.no_grad():
-            for input, target in test_dataloader:
-                input, target = input.to(model.device), target.to(model.device)
-                
-                logits = model.predict(input)
-                N, C, S = logits.shape
-                avg_probs = torch.sum(torch.softmax(logits, dim=1), dim=2) / S
-                
-                metric_collection.update(avg_probs, target)
-        
-        metrics = metric_collection.compute()
-        metric_collection.reset()
+        train_stats = model.evaluate(active_dataloader, return_suffix='_train')
+        val_stats = model.evaluate(val_dataloader, return_suffix='_val')
+        test_stats = model.evaluate(test_dataloader, return_suffix='_test')      
         eval_end = time.time()
 
         # Track stats
@@ -111,9 +96,13 @@ def main(cfg):
             'batch_entropy',
             label_entropy(data.y[al_dataset.active_history[-1]])
         )
-        for metric, value in metrics.items():
-            tracker.track_list_stat(metric, value.item())        
         for metric, value in fit_stats.items():
+            tracker.track_list_stat(metric, value)
+        for metric, value in train_stats.items():
+            tracker.track_list_stat(metric, value)    
+        for metric, value in val_stats.items():
+            tracker.track_list_stat(metric, value)
+        for metric, value in test_stats.items():
             tracker.track_list_stat(metric, value)
 
         # Acquire new data
@@ -122,21 +111,30 @@ def main(cfg):
                 'pool_entropy',
                 label_entropy(data.y[al_dataset.pool_indices])
             )
-            al_dataset.acquire_data(
+            top_k_scores, _ = al_dataset.acquire_data(
                 model=model,
                 acquisition_function=acquisition_function,
                 acquisition_size=cfg.al.acquisition_size
             )
+            tracker.track_list_stat('acquisition_scores', top_k_scores)
 
         t_end = time.time()
         tracker.track_list_stat('iteration_time', t_end - t_start)
 
+        if eval(cfg.inference.inference_class) == MonteCarloDropout:
+            acc_key = 'mcdo_acc_test'
+        elif eval(cfg.inference.inference_class) == SWAG:
+            acc_key = 'swag_acc_test'
+        elif eval(cfg.inference.inference_class) == Deterministic:
+            acc_key = 'model_acc_test'
+        elif eval(cfg.inference.inference_class) == LaplaceApproximation:
+            acc_key = 'la_acc_test'
+
         print(
             f'Acquisition iteration: {tracker.get_stat("acquisition")[-1]}; '
             f'Number of samples: {tracker.get_stat("n_samples")[-1]}; '
-            f'Accuracy: {tracker.get_stat("Accuracy")[-1]}; '
+            f'Accuracy: {tracker.get_stat(acc_key)[-1]}; '
             f'Time: {tracker.get_stat("iteration_time")[-1]}; '
-            #f'LR: {tracker.get_stat("best_lr")[-1]}; '
         )
     
     t_total_end = time.time()

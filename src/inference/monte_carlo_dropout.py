@@ -1,105 +1,52 @@
-import time
 import torch
-import torch.nn as nn
+from src.utils import set_dropout_on
+from src.inference import InferenceBase
 
 
-class MonteCarloDropout(nn.Module):
-    """
-    Infers posterior of model parameters with Monte Carlo dropout.
-    """
+class MonteCarloDropout(InferenceBase):
     def __init__(self, model, n_posterior_samples=100):
-        super().__init__()
-        self.model = model
-        self.device = self.model.device
-        self.n_posterior_samples = n_posterior_samples
+        super().__init__(model, n_posterior_samples=n_posterior_samples)
+        self.alias = 'mcdo'
     
 
     def fit(
         self,
         train_dataloader,
         val_dataloader,
-        n_epochs=50,
-        lr=1e-3,
-        weight_decay=0,
-        dynamic_weight_decay=False,
+        fit_model_hparams,
+        map_dataloader=None,
     ):
         """
-        Fits paramaters of model to data.
+        Fits deterministic model.
         """
-        t_start = time.time()
-
-        self.model.train() # Ensure dropout is enabled
-        train_losses = list()
-        val_losses = list()
-
-        if dynamic_weight_decay is True:
-            weight_decay = weight_decay / len(train_dataloader.dataset)
-
-        optimizer = self.model.optimizer(weight_decay=weight_decay, lr=lr)
-        
-        for epoch in range(n_epochs):
-            
-            # Training loop
-            train_loss = 0
-            for data, target in train_dataloader:
-                data, target = data.to(self.device), target.to(self.device)
-                loss = self.model.loss(data, target)
-                
-                # Take optimizer step
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                train_loss += loss.detach().item()
-            
-            train_losses.append(train_loss / len(train_dataloader.dataset))
-
-            # Validation loop
-            with torch.no_grad():
-                val_loss = 0
-                for data, target in val_dataloader:
-                    data, target = data.to(self.device), target.to(self.device)
-
-                    val_loss += self.model.loss(data, target).detach().item()
-
-            val_losses.append(val_loss / len(val_dataloader.dataset))
-        
-        t_end = time.time()
-
-        stats = {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'fit_time': t_end - t_start
-        }
-        
-        return stats
-
-
+        train_stats = self.fit_model(
+            train_dataloader if map_dataloader is None else map_dataloader,
+            val_dataloader,
+            **fit_model_hparams
+        )
+    
+        return train_stats
+    
+    
     def predict(self, x, n_posterior_samples=None):
+        """
+        Makes predictions for a batch of data with stochastic forward passes.
+        """
         if n_posterior_samples is None:
             n_posterior_samples = self.n_posterior_samples
-  
-        with torch.no_grad():
-            self.train() # Ensure dropout is enabled
-
-            N = len(x)
-            x = x.repeat_interleave(n_posterior_samples, dim=0)
-            logits = self(x).reshape(N, n_posterior_samples, -1).permute(0,2,1)
-
-            return logits
-            
-            """"
-            x = x.repeat_interleave(S, dim=0)
-            pred = torch.logsumexp(
-                self.model.predict(x).reshape(int(len(x)/S), S, -1),
-                dim=1
-            )
-
-            return pred - torch.log(torch.tensor(S))
         
-            pred = torch.softmax(self(x), dim=1)
-            for _ in range(n_posterior_samples-1):
-                pred += torch.softmax(self(x), dim=1)
-            
-            return pred / n_posterior_samples
-            """
+        with torch.no_grad():
+            self.model.eval() 
+            set_dropout_on(self.model) # Ensure dropout is enabled
+            for s in range(n_posterior_samples):
+                model_output = self.model(x)
+
+                if s == 0:
+                    model_outputs = torch.empty(
+                        (n_posterior_samples, *model_output.shape),
+                        device=self.device,
+                    )
+                
+                model_outputs[s,...] = model_output
+             
+            return model_outputs

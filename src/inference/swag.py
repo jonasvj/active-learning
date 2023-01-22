@@ -1,73 +1,38 @@
 import time
+import tqdm
 import torch
+import itertools
 import torch.nn as nn
 from copy import deepcopy
 from omegaconf import OmegaConf
-from torchmetrics import Accuracy
+from src.utils import set_dropout_off
+from src.inference import InferenceBase
 from torch.distributions import LowRankMultivariateNormal
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 
-def get_last_module(model, indices):
-    mod = model
-    for idx in indices:
-        mod = getattr(mod, idx)
-    return mod
-
-
-def replace_params(new_params, model, model_params):
-    pointer = 0
-    for name, p in model_params:
-        indices = name.split(".")
-        mod = get_last_module(model, indices[:-1])
-        p_name = indices[-1]
-        if isinstance(p, nn.Parameter):
-            # We can override Tensors just fine, only nn.Parameters have
-            # custom logic
-            delattr(mod, p_name)
-
-        num_param = p.numel()
-        setattr(
-            mod, p_name, new_params[pointer:pointer + num_param].view_as(p))
-        pointer += num_param
-
-
-class SWAG(nn.Module):
-    """
-    Infers posterior of the model parameters with Stochastic Weight Averaging 
-    Gaussian.
-    """
+class SWAG(InferenceBase):
     def __init__(
         self,
         model,
         K=50,
         n_posterior_samples=100,
-        with_gamma=False,
-        sequential_samples=False
+        sequential_samples=False,
+        batch_norm_dataloader=None
     ):
-        super().__init__()
-        self.model = model
-        self.device = model.device
-        self.n_posterior_samples = n_posterior_samples
-        self.with_gamma = with_gamma
+        super().__init__(model, n_posterior_samples=n_posterior_samples)
         self.sequential_samples = sequential_samples
-        
-        # Fitted model
-        self.fitted_model = None
-        
+        self.batch_norm_dataloader = batch_norm_dataloader
+        self.alias = 'swag'
+ 
         # Rank of covariance matrix
-        self.register_buffer(
-            'K',
-            torch.tensor(K, dtype=torch.long, device=self.device)
-        )
+        self.K = torch.tensor(K, dtype=torch.long, device=self.device)
+
         # Number of model parameters
-        self.register_buffer(
-            'n_params',
-            torch.tensor(
-                sum(p.numel() for p in self.model.parameters()),
-                dtype=torch.long,
-                device=self.device
-            )
+        self.n_params = torch.tensor(
+            sum(p.numel() for p in self.model.parameters()),
+            dtype=torch.long,
+            device=self.device
         )
 
 
@@ -75,41 +40,28 @@ class SWAG(nn.Module):
         """
         Initializes SWAG approximation.
         """
-        # Start from fitted model
-        self.model = deepcopy(self.fitted_model)
-
         # Mean of Gaussian approximation
-        self.mean = deepcopy(self.model).to(self.device)
+        self.mean = deepcopy(self.model)
 
         # Diagonal of covariance matrix
-        self.diag_vec = deepcopy(self.model).to(self.device)
+        self.diag_vec = deepcopy(self.model)
 
         # Deviation vectors for low rank approximation
         self.dev_list = nn.ModuleList(
-            [deepcopy(self.model) for k in range(self.K)]).to(self.device)
+            [deepcopy(self.model) for k in range(self.K)]
+        )
 
         # Diagonal vector is initially estimated as a running average of the
         # (uncentered) second moment
         for param in self.diag_vec.parameters():
             param.detach().copy_(param.detach()**2)
-        
+
         # Number of averaged iterates
-        self.register_buffer(
-            'n_averaged',
-            torch.tensor(1, dtype=torch.long, device=self.device)
-        )
+        self.n_averaged = torch.tensor(1, dtype=torch.long, device=self.device)
 
         # Flag to indicate whether the diagonal has been finalized
-        self.register_buffer(
-            'finalized_diag',
-            torch.tensor(False, dtype=torch.bool, device=self.device)
-        )
-
-        # Factor to scale covariance matrix with 
-        # (Requires grad so it can be optimized)
-        self.log_gamma = nn.Parameter(
-            torch.tensor(0, dtype=torch.float32, device=self.device),
-            requires_grad=True
+        self.finalized_diag = torch.tensor(
+            False, dtype=torch.bool, device=self.device
         )
 
         # Place holders for parameters in vector format
@@ -122,7 +74,7 @@ class SWAG(nn.Module):
         self.iterates = list()
 
 
-    def update_params(self):
+    def update_params(self, model):
         """
         Updates parameters of SWAG approximation (mean vector, diagonal vector
         and deviation vectors).
@@ -134,7 +86,7 @@ class SWAG(nn.Module):
             self.mean.parameters(),
             self.diag_vec.parameters(),
             self.dev_list[dev_idx].parameters(),
-            self.model.parameters()
+            model.parameters()
         )
         
         # Update one parameter group at a time
@@ -155,9 +107,9 @@ class SWAG(nn.Module):
             
             # Substitute "oldest" deviation vector to a new one
             p_dev.detach().copy_(p_model_ - p_mean.detach())
-        
+
         self.n_averaged += 1
-    
+
 
     def finalize_diagonal(self):
         """
@@ -208,7 +160,7 @@ class SWAG(nn.Module):
             dev_mat[:,i] = parameters_to_vector(dev_vec.parameters()).detach()
         
         return dev_mat
-    
+
 
     def fetch_params(self):
         """
@@ -221,368 +173,16 @@ class SWAG(nn.Module):
             self.params_fetched = True
 
 
-    def get_full_covar(self):
-        """
-        Computes the full covariance matrix of the SWAG approximation.
-        """
-        # Low rank approximation and diagonal approximation
-        diag_vec = (
-            self.diagonal_vector
-            if self.params_fetched
-            else self.get_diag() )
-        dev_mat = (
-            self.deviation_matrix
-            if self.params_fetched
-            else self.get_dev_mat() )
-
-        covar_low_rank = dev_mat @ dev_mat.T / (self.K - 1)
-        covar_diag = torch.diag(diag_vec)
-
-        return (covar_diag + covar_low_rank) / 2
-    
-
-    def posterior_distribution(self, with_gamma=None):
-        """
-        Returns the SWAG approximation to the posterior distribution of the 
-        model parameters.
-        """
-        if with_gamma is None:
-            with_gamma = self.with_gamma
-
-        mean_vec = (
-            self.mean_vector
-            if self.params_fetched
-            else self.get_mean() )
-        diag_vec = (
-            self.diagonal_vector
-            if self.params_fetched
-            else self.get_diag() )
-        dev_mat = (
-            self.deviation_matrix
-            if self.params_fetched
-            else self.get_dev_mat() )
-        
-        gamma = torch.exp(self.log_gamma) if with_gamma else 1
-        
-        return LowRankMultivariateNormal(
-            loc=mean_vec,
-            cov_factor=torch.sqrt(gamma/(2*(self.K - 1)))*dev_mat,
-            cov_diag=gamma*diag_vec/2
-        )
-        """
-        LowRankMultivariateNormal samples with covariance matrix:
-        covariance_matrix = cov_factor @ cov_factor.T + cov_diag
-        If we set (g is shorthand for gamma):
-        cov_factor = sqrt(g)/sqrt(2*(K-1)) * dev_mat
-        cov_diag = (g/2)*covar_diag
-        Then:
-        covariance_matrix 
-         = (g/2)*covar_diag + sqrt(g)/sqrt(2*(K-1))
-            * dev_mat @ (sqrt(g)/sqrt(2*(K-1)) * dev_mat).T
-         = (g/2)*covar_diag + sqrt(g)/sqrt(2*(K-1))
-            * sqrt(g)/sqrt(2*(K-1)) * dev_mat @ dev_mat.T
-         = (g/2)*covar_diag + (sqrt(g)/sqrt(2*(K-1)))^2 * dev_mat @ dev_mat.T
-         = (g/2)*covar_diag + g/(2*(K-1)) * dev_mat @ dev_mat.T
-         = (g/2)*covar_diag + (1/2)*(g/(K-1)) * dev_mat @ dev_mat.T
-         = (g*covar_diag + (g/(K-1)) * dev_mat @ dev_mat.T) / 2
-         = g * (covar_diag + (1/(K-1)) * dev_mat @ dev_mat.T) / 2
-         = g * (covar_diag + covar_low_rank) / 2
-        which is what we want.
-        """
-
-
-    def sample_parameters(self, with_gamma=None, n_samples=1):
-        """
-        Samples from the approximate posterior distribution of the model
-        parameters.
-        """
-        if with_gamma is None:
-            with_gamma = self.with_gamma
-        
-        return self.posterior_distribution(
-            with_gamma=with_gamma).sample(sample_shape=(n_samples,))
-        
-    
-    def predict(
-        self,
-        x,
-        with_gamma=None,
-        n_posterior_samples=None,
-        sequential_samples=None
-    ):
-        """
-        Makes predictions for new input using the SWAG approximate posterior
-        distribution.
-        """
-        if with_gamma is None:
-            with_gamma = self.with_gamma
-        if n_posterior_samples is None:
-            n_posterior_samples = self.n_posterior_samples
-        if sequential_samples is None:
-            sequential_samples = self.sequential_samples
-
-        # Create copy of model so we don't overwrite mean of SWAG model with
-        # posterior samples
-        model = deepcopy(self.mean).to(self.device)
-        model.eval()
-        
-        # Move data to device
-        x = x.to(self.device)
-
-        # (Possibly) sample parameters from posterior 
-        if not sequential_samples:
-            posterior_samples = self.sample_parameters(
-                with_gamma=with_gamma,
-                n_samples=n_posterior_samples
-            )
-
-        for s in range(n_posterior_samples):
-            # Get posterior sample of parameters
-            sample = (
-                self.sample_parameters(with_gamma=with_gamma).squeeze()
-                if sequential_samples
-                else posterior_samples[s,:]
-            )
-
-            # Overwrite model parameters with new sample
-            vector_to_parameters(sample, model.parameters())
-
-            # Do predictions
-            pred = model(x).detach().squeeze()
-
-            # Tensor for holding predictions
-            if s == 0:
-                posterior_y = torch.empty(
-                    (*pred.shape, n_posterior_samples),
-                    device=self.device,
-                )
-            
-            posterior_y[...,s] = pred
-        
-        return posterior_y
-
-
-    def compute_lpd(
-        self,
-        x,
-        y,
-        with_gamma=None,
-        n_posterior_samples=None,
-        sequential_samples=None
-    ):
-        """
-        Computes the log predictive density of input data using the SWAG 
-        approximate posterior distribution.
-        """
-        if with_gamma is None:
-            with_gamma = self.with_gamma
-        if n_posterior_samples is None:
-            n_posterior_samples = self.n_posterior_samples
-        if sequential_samples is None:
-            sequential_samples = self.sequential_samples
-        
-
-        # Create copy of model so we don't overwrite mean of SWAG model with
-        # posterior samples
-        model = deepcopy(self.mean).to(self.device)
-        model.eval()
-
-        # Move data to device
-        x, y = x.to(self.device), y.to(self.device)
-
-        # Tensor for holding log densities
-        log_densities = torch.empty(
-            (len(y), n_posterior_samples),
-            device=self.device
-        )
-
-        # (Possibly) sample parameters from posterior 
-        if not sequential_samples:
-            posterior_samples = self.sample_parameters(
-                with_gamma=with_gamma,
-                n_samples=n_posterior_samples
-            )
-
-        for s in range(n_posterior_samples):
-            # Get posterior sample of parameters
-            sample = (
-                self.sample_parameters(with_gamma=with_gamma).squeeze()
-                if sequential_samples
-                else posterior_samples[s,:]
-            )
-
-            # Overwrite model parameters with new sample
-            vector_to_parameters(sample, model.parameters())
-
-            # Get log densities
-            log_densities[:,s] = model.log_density(x, y).detach().squeeze()
-        
-        # Compute lpd
-        lpd = (
-            -len(y)*torch.log(torch.tensor(n_posterior_samples))
-            + torch.logsumexp(log_densities, dim=-1).sum() )
-
-        return lpd
-
-
-    def compute_elbo(
-        self,
-        x,
-        y,
-        n_variational_samples=100,
-        sequential_samples=None
-    ):
-        """
-        Compute ELBO of base model, where the variational distribution is the 
-        swag posterior with the covariance matrix scaled by gamma.
-        """
-        if sequential_samples is None:
-            sequential_samples = self.sequential_samples
-        
-        variational_dist = self.posterior_distribution(with_gamma=True)
-        
-        # Copy of base model, so we don't overwrite swag parameters
-        model = deepcopy(self.mean).to(self.device)
-        model_params = list(model.named_parameters())
-        model.eval()
-
-        # Get all samples at once (if memory is not an issue)
-        if not sequential_samples:
-            variational_samples = variational_dist.rsample(
-                sample_shape=(n_variational_samples,)
-            )
-        
-        elbo = 0
-        for s in range(n_variational_samples):
-            sample = (
-                variational_dist.rsample(sample_shape=(1,)).squeeze() 
-                if sequential_samples
-                else variational_samples[s,:]
-            )
-            
-            # Overwrite model parameters with new sample
-            replace_params(sample, model, model_params)
-
-            # Evaluate log joint distribution and add to sum
-            mb_factor = model.n_train / len(y)
-            elbo += mb_factor*model.log_likelihood(x, y) + model.log_prior()
-        
-        return elbo/n_variational_samples + variational_dist.entropy()
-    
-
-    def fit_model(
-        self,
-        train_dataloader,
-        val_dataloader,
-        n_epochs=50,
-        lr=1e-3,
-        weight_decay=0,
-        dynamic_weight_decay=False,
-    ):
-        """
-        Fits the parameters of the model to data.
-        """
-        t_start = time.time()
-        train_losses = list()
-        val_losses = list()
-
-        if dynamic_weight_decay is True:
-            weight_decay = weight_decay / len(train_dataloader.dataset)
-        
-        optimizer = self.model.optimizer(weight_decay=weight_decay, lr=lr)
-        
-        for epoch in range(n_epochs):
-            
-            # Training loop
-            self.model.train()
-            train_loss = 0
-            for data, target in train_dataloader:
-                data, target = data.to(self.device), target.to(self.device)
-                loss = self.model.loss(data, target)
-                
-                # Take optimizer step
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                train_loss += loss.detach().item()
-            
-            train_losses.append(train_loss / len(train_dataloader.dataset))
-
-            # Validation loop
-            with torch.no_grad():
-                self.model.eval()
-                val_loss = 0
-                for data, target in val_dataloader:
-                    data, target = data.to(self.device), target.to(self.device)
-
-                    val_loss += self.model.loss(data, target).detach().item()
-
-            val_losses.append(val_loss / len(val_dataloader.dataset))
-
-            #print("Train loss: {:.6E}".format(train_losses[-1]))
-
-        
-        self.model.eval()
-        accuracy = Accuracy()
-        accuracy.to(self.device)
-        
-        val_loss = 0
-        val_lpd = 0
-        for data, target in val_dataloader:
-            data, target = data.to(self.device), target.to(self.device)
-
-            val_lpd += self.model.log_likelihood(data, target)
-            val_loss += self.model.loss(data, target).detach().item()
-
-            preds = self.model(data)
-            accuracy.update(preds, target)
-        
-        val_loss = val_loss / len(val_dataloader.dataset)
-        val_lpd = val_lpd / len(val_dataloader.dataset)
-        val_accuracy = accuracy.compute()
-        accuracy.reset()
-
-
-        train_loss = 0
-        train_lpd = 0
-        for data, target in train_dataloader:
-            data, target = data.to(self.device), target.to(self.device)
-
-            train_lpd += self.model.log_likelihood(data, target)
-            train_loss += self.model.loss(data, target).detach().item()
-
-            preds = self.model(data)
-            accuracy.update(preds, target)
-        
-        train_loss = train_loss / len(train_dataloader.dataset)
-        val_loss = val_loss / len(val_dataloader.dataset)
-        train_accuracy = accuracy.compute()
-        accuracy.reset()
-        
-        self.model.train()
-        self.fitted_model = deepcopy(self.model)
-
-        t_end = time.time()
-
-        stats = {
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'time_fit': t_end - t_start
-        }
-
-        return stats
-
-
     def fit_swag(
         self,
         dataloader,
-        swag_steps=1000,
+        swag_epochs=100,
         swag_lr=1e-3,
-        update_freq=10,
+        swag_weight_decay=0,
+        swag_momentum=0,
         clip_value=None,
         save_iterates=False,
-        train_mode=False
+        drop_out=False
     ):
         """
         Computes the SWAG approximation to the posterior of the model
@@ -590,54 +190,49 @@ class SWAG(nn.Module):
         """
         t_start = time.time()
         self.init_swag()
+        self.swag_weight_decay = swag_weight_decay
         swag_losses = list()
-        
-        if train_mode:
-            self.model.train()
-        else:
-            self.model.eval()
-        
+        print(f'SWAG batch size: {dataloader.batch_size}')
+
+        model = deepcopy(self.model)
+        model.train()
+        if not drop_out:
+            set_dropout_off(model)
+
         optimizer = torch.optim.SGD(
-            self.model.parameters(),
-            lr=swag_lr
+            model.parameters(),
+            lr=swag_lr,
+            weight_decay=swag_weight_decay,
+            momentum=swag_momentum
         )
         
-        for step in range(1, swag_steps + 1):
-            # Get mini batch and compute loss
-            x_mb, y_mb = next(iter(dataloader))
-            x_mb, y_mb = x_mb.to(self.device), y_mb.to(self.device)
-            loss = self.model.loss(x_mb, y_mb)
-            
-            # Take SGD step
-            optimizer.zero_grad()
-            loss.backward()
-            if clip_value is not None:
-                nn.utils.clip_grad_value_(self.model.parameters(), clip_value)
-            optimizer.step()
+        pbar = tqdm.trange(swag_epochs, desc="Fitting SWAG")
+        for epoch in pbar:
+            swag_loss = 0
+            for data, target in dataloader:
+                data, target = data.to(self.device), target.to(self.device)
 
-            if step % update_freq == 0:
-                self.update_params()
-                if save_iterates:
-                    self.iterates.append(
-                        parameters_to_vector(
-                            self.model.parameters()).detach().tolist()
-                    )
-            
-            swag_losses.append(loss.detach().item() / len(y_mb))
-            #print("SWAG loss: {:.6E}".format(swag_losses[-1]))
+                model_output = model(data)
+                loss = model.loss(model_output, target)
 
+                # Take SGD step
+                optimizer.zero_grad()
+                loss.backward()
+                if clip_value is not None:
+                    nn.utils.clip_grad_value_(model.parameters(), clip_value)
+                optimizer.step()
+
+                swag_loss += loss.detach().item()  
+            swag_losses.append(swag_loss / len(dataloader.dataset))
+
+            self.update_params(model)
+            if save_iterates:
+                self.iterates.append(
+                    parameters_to_vector(model.parameters()).detach().tolist()
+                )
+       
         self.finalize_diagonal()
         self.fetch_params()
-        
-        swag_trace = torch.sum(
-            self.posterior_distribution(with_gamma=False).variance
-        )
-        accuracy = Accuracy()
-        
-        
-
-
-
         t_end = time.time()
 
         stats = {
@@ -653,67 +248,76 @@ class SWAG(nn.Module):
         self,
         train_dataloader,
         val_dataloader,
-        swag_steps=1000,
+        swag_epochs=100,
         swag_lrs=[1e-3],
-        update_freq=10,
+        swag_weight_decay=0,
+        swag_momentum=0,
         clip_value=None,
         save_iterates=False,
+        drop_out=False,
         val_criterion='accuracy'
-    ):  
+    ):
         t_start = time.time()
-        
-        val_metrics = list()
         best_val_metric = -float('inf')
+        suffix = '_val_lr'
+        val_metrics = dict()
 
-        accuracy = Accuracy()
-        accuracy.to(self.device)
-        
-        for swag_lr in swag_lrs:
+        for i, swag_lr in enumerate(swag_lrs):
 
             # Fit SWAG model
             try:
                 rng_state = torch.get_rng_state()
                 rng_state_gpu = torch.cuda.get_rng_state_all()
                 swag_stats = self.fit_swag(
-                    train_dataloader,
-                    swag_steps=swag_steps,
+                    dataloader=train_dataloader,
+                    swag_epochs=swag_epochs,
                     swag_lr=swag_lr,
-                    update_freq=update_freq,
+                    swag_weight_decay=swag_weight_decay,
+                    swag_momentum=swag_momentum,
                     clip_value=clip_value,
-                    save_iterates=save_iterates
+                    save_iterates=save_iterates,
+                    drop_out=drop_out
                 )
 
-                with torch.no_grad():
-                    lpd = 0
-                    for input, target in val_dataloader:
-                        input = input.to(self.device)
-                        target = target.to(self.device)
+                stats = self.evaluate(
+                    val_dataloader,
+                    n_posterior_samples=self.n_posterior_samples,
+                    return_suffix=suffix,
+                    include_deterministic=False
+                )
+                """
+                if i == 0:
+                    for key, value in stats.items():
+                        val_metrics[key] = [value]
+                        val_metrics['swag_lr' + suffix] = [swag_lr]
+                else:
+                    for key, value in stats.items():
+                        val_metrics[key].append(value)
+                        val_metrics['swag_lr' + suffix].append(swag_lr)
+                """
+                for key, value in stats.items():
+                    if key in val_metrics:
+                        val_metrics[key].append(value)
+                    else:
+                        val_metrics[key] = [value]
+                    
+                    if 'swag_lr' + suffix in val_metrics:
+                        val_metrics['swag_lr' + suffix].append(swag_lr)
+                    else:
+                        val_metrics['swag_lr' + suffix] = [swag_lr]
 
-                        if val_criterion == 'accuracy':
-
-                            logits = self.predict(input)            
-                            N, C, S = logits.shape
-                            avg_probs = torch.sum(
-                                torch.softmax(logits, dim=1), dim=2) / S
-                            accuracy.update(avg_probs, target)
-                        
-                        elif val_criterion == 'lpd':
-                            lpd += self.compute_lpd(input, target).item()
-
-                    if val_criterion == 'accuracy':
-                        val_metric = accuracy.compute().item()
-                    elif val_criterion == 'lpd':
-                        val_metric = lpd / len(val_dataloader.dataset)
+                if val_criterion == 'accuracy':
+                    val_metric = val_metrics['acc' + suffix][-1]
+                elif val_criterion == 'lpd':
+                    val_metric = val_metrics['lpd' + suffix][-1]
 
             except ValueError as e:
                 print(f'Error while fitting SWAG with learning rate {swag_lr}.')
                 print(f'Error message: {e}')
+                for key in val_metrics:
+                    val_metrics[key].append(-float('inf'))
                 val_metric = -float('inf')
             
-            val_metrics.append(val_metric)
-            accuracy.reset()
-            lpd = 0
-
             if val_metric > best_val_metric:
                 best_val_metric = val_metric
                 best_lr = swag_lr
@@ -721,90 +325,32 @@ class SWAG(nn.Module):
                 used_rng_state_gpu = rng_state_gpu
         
         # Fit SWAG with best learning rate
+        print('Best SWAG lr:', best_lr)
         torch.set_rng_state(used_rng_state)
         torch.cuda.set_rng_state_all(used_rng_state_gpu)
+
         swag_stats = self.fit_swag(
-            train_dataloader,
-            swag_steps=swag_steps,
+            dataloader=train_dataloader,
+            swag_epochs=swag_epochs,
             swag_lr=best_lr,
-            update_freq=update_freq,
+            swag_weight_decay=swag_weight_decay,
+            swag_momentum=swag_momentum,
             clip_value=clip_value,
-            save_iterates=save_iterates
+            save_iterates=save_iterates,
+            drop_out=drop_out
         )
-       
+
         t_end = time.time()
         
         # Save stats
-        swag_stats['val_metrics'] = val_metrics
         swag_stats['best_val_metric'] = best_val_metric
         swag_stats['swag_lrs'] = swag_lrs
         swag_stats['best_lr'] = best_lr
         swag_stats['time_swag_lr'] = t_end - t_start
-
-        """
-        best_lpd_idx = int(torch.argmax(torch.tensor(val_lpds)))
-        print(swag_stats['swag_lrs'])
-        print(swag_stats['val_accuracies'])
-        print(val_lpds)
-        print(swag_stats['best_val_accuracy'], swag_stats['best_lr'])
-        print(val_lpds[best_lpd_idx], swag_lrs[best_lpd_idx])
-        """
+        for key, value in val_metrics.items():
+            swag_stats[key] = value
+        
         return swag_stats
-
-
-    def optimize_covar(
-        self,
-        dataloader,
-        svi_lr=1e-2,
-        svi_steps=1000,
-        mini_batch=False,
-        n_variational_samples=100,
-        sequential_samples=False,
-    ):
-        """"
-        Optimizes the scale of the covariance matrix in the SWAG approximation.
-        """
-        t_start = time.time()
-        elbos = list()
-        log_gammas = list()
-
-        optimizer = torch.optim.Adam(
-            [self.log_gamma],
-            lr=svi_lr,
-            maximize=True)
-
-        for step in range(svi_steps):
-            # Get mini batch and compute elbo
-            x_mb, y_mb = (
-                next(iter(dataloader)) if mini_batch 
-                else dataloader.dataset.tensors
-            )
-            x_mb, y_mb = x_mb.to(self.device), y_mb.to(self.device)
-
-            elbo = self.compute_elbo(
-                x_mb,
-                y_mb,
-                n_variational_samples=n_variational_samples,
-                sequential_samples=sequential_samples)
-
-            # Take Adam step
-            optimizer.zero_grad()
-            elbo.backward()
-            optimizer.step()
-
-            elbos.append(elbo.detach().item())
-            log_gammas.append(self.log_gamma.detach().item())
-            #print("ELBO: {:.6e}; Gamma: {:.6e}; Gradient: {:.6e}".format(elbos[-1], log_gammas[-1], self.log_gamma.grad.item()))
-
-        t_end = time.time()
-
-        stats = {
-            'elbos': elbos,
-            'log_gammas': log_gammas,
-            'time_svi': t_end - t_start
-        }
-
-        return stats
 
 
     def fit(
@@ -813,22 +359,31 @@ class SWAG(nn.Module):
         val_dataloader,
         fit_model_hparams,
         fit_swag_hparams,
-        fit_covar_hparams,
-        optimize_covar=False
+        map_dataloader=None,
     ):
         """
-        Fits the model to data, computes the SWAG approximation and possibly
-        optimizes the scale of the covariance matrix in the SWAG approximation.
+        Fits the model to data and computes the SWAG approximation.
         """
+        self.train_dataloader = train_dataloader
+
         stats_fit = self.fit_model(
-                train_dataloader, val_dataloader, **fit_model_hparams
-            )
+            train_dataloader if map_dataloader is None else map_dataloader,
+            val_dataloader,
+            **fit_model_hparams
+        )
 
         # Create new dataloader for SWAG (different batch size)
-        fit_swag_hparams_dict = OmegaConf.to_container(fit_swag_hparams)
+        if isinstance(fit_swag_hparams, dict):
+            fit_swag_hparams_dict = fit_swag_hparams
+        else:
+            fit_swag_hparams_dict = OmegaConf.to_container(fit_swag_hparams, resolve=True)
         swag_batch_size = fit_swag_hparams_dict.pop('swag_batch_size')
         swag_lr = fit_swag_hparams_dict.pop('swag_lr')
         val_criterion = fit_swag_hparams_dict.pop('val_criterion')
+        if 'drop_last' in fit_swag_hparams_dict:
+            drop_last = fit_swag_hparams_dict.pop('drop_last')
+        else:
+            drop_last = False
 
         # Set batch size
         if swag_batch_size is None:
@@ -836,7 +391,10 @@ class SWAG(nn.Module):
 
         # Create dataloader
         swag_dataloader = torch.utils.data.DataLoader(
-            train_dataloader.dataset, batch_size=swag_batch_size, shuffle=True
+            train_dataloader.dataset,
+            batch_size=swag_batch_size,
+            shuffle=True,
+            drop_last=drop_last
         )
 
         # Fit swag and possibly tune learning rate
@@ -855,17 +413,179 @@ class SWAG(nn.Module):
                 **fit_swag_hparams_dict
             )
 
-        if optimize_covar:
-            stats_svi = self.optimize_covar(train_dataloader, **fit_covar_hparams)
-            print(f'Log gamma: {stats_svi["log_gammas"][-1]}')
+        return stats_fit | stats_swag
+
+
+    def posterior_distribution(self):
+        """
+        Returns the SWAG approximation to the posterior distribution of the 
+        model parameters.
+        """
+        mean_vec = (
+            self.mean_vector
+            if self.params_fetched
+            else self.get_mean() )
+        diag_vec = (
+            self.diagonal_vector
+            if self.params_fetched
+            else self.get_diag() )
+        dev_mat = (
+            self.deviation_matrix
+            if self.params_fetched
+            else self.get_dev_mat() )
+        
+        return LowRankMultivariateNormal(
+            loc=mean_vec,
+            cov_factor=torch.sqrt(1/(2*(self.K - 1)))*dev_mat,
+            cov_diag=diag_vec/2
+        )
+
+
+    def sample_parameters(self, n_samples=1):
+        """
+        Samples from the approximate posterior distribution of the model
+        parameters.
+        """
+        return self.posterior_distribution().sample(sample_shape=(n_samples,))
+
+
+    def predict(
+        self,
+        x,
+        n_posterior_samples=None,
+        sequential_samples=None,
+        samples=None
+    ):
+        """
+        Makes predictions for new input using the SWAG approximate posterior
+        distribution.
+        """
+        if n_posterior_samples is None:
+            n_posterior_samples = self.n_posterior_samples
+        if sequential_samples is None:
+            sequential_samples = self.sequential_samples
+        if self.batch_norm_dataloader is not None:
+            batch_norm_dataloader = self.batch_norm_dataloader
         else:
-            stats_svi = {}
+            batch_norm_dataloader = self.train_dataloader
 
-        return stats_fit | stats_swag | stats_svi
+        with torch.no_grad():
+            # Create copy of model so we don't overwrite mean of SWAG model
+            # with posterior samples
+            model = deepcopy(self.mean)
+            model.eval()
+            
+            # Use provided samples
+            if samples is not None:
+                posterior_samples = samples
+                sequential_samples = False
+                n_posterior_samples = posterior_samples.shape[0]
+            
+            # (Possibly) sample parameters from posterior 
+            elif not sequential_samples:
+                posterior_samples = self.sample_parameters(
+                    n_samples=n_posterior_samples
+                )
+
+            for s in range(n_posterior_samples):
+                # Get posterior sample of parameters
+                sample = (
+                    self.sample_parameters().squeeze()
+                    if sequential_samples
+                    else posterior_samples[s,:]
+                )
+
+                # Overwrite model parameters with new sample
+                vector_to_parameters(sample, model.parameters())
+
+                # Update batch norm statistics
+                bn_update(batch_norm_dataloader, model)
+                model.eval()
+
+                # Get model output
+                model_output = model(x)
+
+                # Tensor for holding predictions
+                if s == 0:
+                    model_outputs = torch.empty(
+                        (n_posterior_samples, *model_output.shape),
+                        device=self.device,
+                    )
+                
+                model_outputs[s,...] = model_output
+
+            return model_outputs
 
 
+    def get_covariance(self):
+        """"
+        Gets covariance matrix of posterior distribution.
+        """
+        return self.posterior_distribution().covariance_matrix
 
-if __name__ == '__main__':
-    from src.models import MNISTConvNet
-    model = MNISTConvNet(n_train=100)
-    swag = SWAG(model=model)
+
+def _check_bn(module, flag):
+    if issubclass(module.__class__, torch.nn.modules.batchnorm._BatchNorm):
+        flag[0] = True
+
+
+def check_bn(model):
+    flag = [False]
+    model.apply(lambda module: _check_bn(module, flag))
+    return flag[0]
+
+
+def reset_bn(module):
+    if issubclass(module.__class__, torch.nn.modules.batchnorm._BatchNorm):
+        module.running_mean = torch.zeros_like(module.running_mean)
+        module.running_var = torch.ones_like(module.running_var)
+
+
+def _get_momenta(module, momenta):
+    if issubclass(module.__class__, torch.nn.modules.batchnorm._BatchNorm):
+        momenta[module] = module.momentum
+
+
+def _set_momenta(module, momenta):
+    if issubclass(module.__class__, torch.nn.modules.batchnorm._BatchNorm):
+        module.momentum = momenta[module]
+
+
+def bn_update(loader, model, verbose=False, subset=None, with_grad=False, **kwargs):
+    """
+        BatchNorm buffers update (if any).
+        Performs 1 epochs to estimate buffers average using train dataset.
+        :param loader: train dataset loader for buffers average estimation.
+        :param model: model being update
+        :return: None
+    """
+    if not check_bn(model):
+        return
+    model.train()
+    momenta = {}
+    model.apply(reset_bn)
+    model.apply(lambda module: _get_momenta(module, momenta))
+    n = 0
+    num_batches = len(loader)
+
+    with torch.set_grad_enabled(with_grad):
+        if subset is not None:
+            num_batches = int(num_batches * subset)
+            loader = itertools.islice(loader, num_batches)
+        if verbose:
+
+            loader = tqdm.tqdm(loader, total=num_batches)
+        for input, _ in loader:
+            input = input.cuda(non_blocking=True)
+            input_var = torch.autograd.Variable(input)
+            #b = input_var.data.size(0)
+            b = input_var.size(0)
+
+            momentum = b / (n + b)
+            for module in momenta.keys():
+                module.momentum = momentum
+
+            model(input_var, **kwargs)
+            n += b
+
+    model.apply(lambda module: _set_momenta(module, momenta))
