@@ -91,3 +91,5 @@ target/
 # Hydra outputs
 /outputs/
 /misc_files/
+.dill
+*.dill

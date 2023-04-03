@@ -1,0 +1,12 @@
+inference_class: FullVI
+
+init_hparams:
+  n_posterior_samples: 100
+
+fit_hparams:
+  fit_vi_hparams:
+    n_epochs: 50
+    lr: 1e-3
+    guide: diagonal
+    num_particles: 1
+    vectorize_particles: false
